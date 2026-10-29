@@ -1,0 +1,64 @@
+[package]
+name = "x28-pro"
+version = "0.2.0"
+edition = "2021"
+description = "ZLT X28 PRO router status: CLI and macOS menu bar tray (temperature, network, band)"
+license = "MIT"
+readme = "README.md"
+
+[features]
+default = ["tray"]
+# `--no-default-features` builds the CLI only (fast, no GPUI toolchain).
+tray = [
+    "dep:gpui", "dep:gpui-tray", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation",
+    "dep:block2", "dep:async-channel",
+]
+
+[dependencies]
+# Light dependency tree: ureq is a small blocking client on rustls (no OpenSSL,
+# no tokio), which keeps startup time and binary size down for a 3-request CLI.
+ureq = { version = "2.10", features = ["tls"] }
+# Matched to ureq's rustls (same feature set, no aws-lc-rs) so we can build a
+# ClientConfig that accepts the router's self-signed certificate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+sha2 = "0.10"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Menu bar tray (only with the `tray` feature).
+gpui = { version = "=0.2.2", optional = true }
+# NB: gpui-tray's `menu-state` feature needs gpui APIs that only exist upstream,
+# not in crates.io gpui 0.2.2, so it stays off.
+gpui-tray = { version = "0.3", optional = true }
+# AppKit calls gpui does not expose: the popover's position (status item,
+# menu bar height) and the Dock/Stage Manager presence (activation policy).
+# Same versions gpui-tray already pulls in.
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std", "block2", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication", "NSScreen",
+    "NSWindow",
+    "objc2-core-foundation",
+] }
+# Close the popover on clicks in other apps: an AppKit event monitor (block)
+# hands each click to a gpui task through a channel.
+block2 = { version = "0.6", optional = true }
+async-channel = { version = "2", optional = true }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
+    "std", "NSArray", "NSGeometry", "objc2-core-foundation",
+] }
+
+[[bin]]
+name = "x28-pro"
+path = "src/main.rs"
+
+[[bin]]
+name = "x28-tray"
+path = "src/bin/x28-tray/main.rs"
+required-features = ["tray"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,10 @@
+# The login to the router needs no C toolchain flags, but this machine's shell
+# exports CFLAGS/CXXFLAGS with `-flto=thin`. The `cc` crate passes those to
+# ring's C/assembly build, which produces LLVM-23 ThinLTO bitcode that Apple's
+# ld64 cannot read ("Invalid summary version 14 ... should be in the range
+# [1-12]") and crashes while linking. Clear them for builds of this crate only.
+
+[env]
+CFLAGS = { value = "", force = true }
+CXXFLAGS = { value = "", force = true }
+LDFLAGS = { value = "", force = true }
