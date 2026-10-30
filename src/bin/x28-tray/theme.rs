@@ -434,33 +434,32 @@ impl Theme {
             .child(text)
     }
 
-    /// M3 filter chip: outlined when off, secondary container with a check
-    /// when on.
+    /// Filter chip: outlined when off, filled with the primary container
+    /// color when on. Same border and content in both states, so selecting a
+    /// chip never changes its size.
     pub fn filter_chip(&self, selected: bool, label: String) -> Div {
         let base = div()
             .h(px(30.))
             .px(px(12.))
             .flex()
             .items_center()
-            .gap(px(4.))
             .rounded_lg()
+            .border_1()
             .text_xs()
             .font_weight(FontWeight::MEDIUM)
-            .cursor_pointer();
+            .cursor_pointer()
+            .child(label);
         if selected {
-            let hover = self.secondary_container_hover;
-            base.bg(self.secondary_container)
-                .text_color(self.on_secondary_container)
-                .hover(move |s| s.bg(hover))
-                .child("✓")
-                .child(label)
+            let hover = self.primary_container_hover;
+            base.bg(self.primary_container)
+                .border_color(self.primary_container)
+                .text_color(self.on_primary_container)
+                .hover(move |s| s.bg(hover).border_color(hover))
         } else {
             let hover = self.surface_container_high;
-            base.border_1()
-                .border_color(self.outline_variant)
+            base.border_color(self.outline_variant)
                 .text_color(self.on_surface_variant)
                 .hover(move |s| s.bg(hover))
-                .child(label)
         }
     }
 
