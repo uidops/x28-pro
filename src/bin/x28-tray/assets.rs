@@ -28,6 +28,8 @@ const ICONS: &[(&str, &str)] = &[
     ("logout", r#"<path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M9 16l-4-4 4-4M5 12h10"/>"#),
     // data connection: globe
     ("globe", r#"<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 3.8 5.5 3.8 9s-1.3 6.5-3.8 9M12 3c-2.5 2.5-3.8 5.5-3.8 9s1.3 6.5 3.8 9"/>"#),
+    // cell lock: crosshair on a cell
+    ("target", r#"<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3"/>"#),
     ("pause", r#"<rect x="6.5" y="5" width="3.5" height="14" rx="1.2" fill="black" stroke="none"/><rect x="14" y="5" width="3.5" height="14" rx="1.2" fill="black" stroke="none"/>"#),
     ("play", r#"<path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z" fill="black" stroke="none"/>"#),
     ("alert", r#"<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5"/><circle cx="12" cy="16.5" r="1.2" fill="black" stroke="none"/>"#),

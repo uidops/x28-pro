@@ -2,7 +2,7 @@
 //!
 //! A frosted Material surface with the live link (network, operator, signal
 //! meters), device stats, quick settings that expand in place (network mode,
-//! 4G/5G band lock, operator, restart) and footer actions. It closes when it
+//! 4G/5G band lock, cell lock, operator, restart) and footer actions. It closes when it
 //! loses focus, like a system menu bar extra.
 
 use std::collections::BTreeSet;
@@ -10,26 +10,27 @@ use std::time::Instant;
 
 use gpui::prelude::*;
 use gpui::{div, px, svg, Context, Div, FocusHandle, FontWeight, Hsla, Render, Subscription, Window};
-use x28_pro::{operator_name, signal_label, Heat, NetworkMode, OperatorSelection, Quality, OPERATORS};
+use x28_pro::{operator_name, signal_label, Heat, LockState, NetworkMode, OperatorSelection, Quality, OPERATORS};
 
 use crate::assets::icon;
 use crate::theme::Theme;
 use crate::{
-    apply_network_mode, apply_operator, open_panel_at, router_task, AppState, PopoverRef, Quit,
-    TogglePause, REATTACH_NOTE,
+    apply_lte_cell_lock, apply_network_mode, apply_nr_cell_lock, apply_operator, open_panel_at,
+    router_task, AppState, PopoverRef, Quit, TogglePause, REATTACH_NOTE,
 };
 use crate::panel::Tab;
 
 pub(crate) const WIDTH: f32 = 360.;
 /// Fits everything with the quick settings collapsed (5G row included);
 /// expanded sections scroll. Shrunk to fit short screens (see `appkit`).
-pub(crate) const HEIGHT: f32 = 940.;
+pub(crate) const HEIGHT: f32 = 1000.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     Mode,
     /// Band lock for the 5G radio when true, 4G when false.
     Bands(bool),
+    CellLock,
     Operator,
 }
 
@@ -123,6 +124,34 @@ impl Popover {
 
 fn ico(name: &str, size: f32, color: Hsla) -> impl IntoElement {
     svg().path(icon(name)).size(px(size)).flex_none().text_color(color)
+}
+
+/// One radio in the cell lock section: name, lock state, cell details and an
+/// action button.
+fn cell_line(t: &Theme, radio: &str, state: &str, state_color: Hsla, detail: String, button: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(6.))
+                        .text_sm()
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(radio.to_string()))
+                        .child(div().text_color(state_color).child(state.to_string())),
+                )
+                .child(div().text_xs().text_color(t.on_surface_variant).truncate().child(detail)),
+        )
+        .child(button)
 }
 
 /// Rounded tonal disc holding a leading icon.
@@ -678,6 +707,110 @@ impl Render for Popover {
                             .child(apply),
                     ),
             );
+        }
+
+        // physical cell lock: one tap to lock the serving cell or unlock
+        if let Some(lock) = router.as_ref().and_then(|r| r.cell_lock.clone()) {
+            let nr_allowed = router.as_ref().is_some_and(|r| r.allows_nr());
+            let summary = match (lock.lte.is_some(), lock.nr.is_some(), lock.lte_state, lock.nr_state) {
+                (_, _, LockState::Failed, _) | (_, _, _, LockState::Failed) => "Lock failed".to_string(),
+                (true, true, ..) => "4G + 5G locked".to_string(),
+                (true, false, ..) => "4G locked".to_string(),
+                (false, true, ..) => "5G locked".to_string(),
+                (false, false, ..) => "Unlocked".to_string(),
+            };
+            let open = self.expanded == Some(Section::CellLock);
+            settings = settings.child(
+                row("qs-cell", "target", "Cell lock", summary, open)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle(Section::CellLock, cx))),
+            );
+            if open {
+                let current_lte = status.as_ref().and_then(|s| s.current_lte_cell());
+                let current_nr = status.as_ref().and_then(|s| s.current_nr_cell());
+                let small_button = |id: (&'static str, usize), label: &str, enabled: bool| {
+                    let b = t
+                        .tonal()
+                        .id(id)
+                        .h(px(28.))
+                        .px(px(12.))
+                        .flex()
+                        .items_center()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(label.to_string());
+                    if enabled { b.cursor_pointer() } else { t.disabled(b) }
+                };
+                let state_color = |s: LockState| match s {
+                    LockState::Locked => t.good,
+                    LockState::Failed => t.bad,
+                    LockState::Unlocked => t.on_surface_variant,
+                };
+                let mut list = div().flex().flex_col().gap(px(10.)).px(px(10.)).pt(px(4.)).pb(px(10.));
+
+                // 4G
+                let detail = match lock.lte.as_ref().and_then(|c| c.first()) {
+                    Some(c) => format!("EARFCN {} · PCI {}", c.earfcn, if c.pci.is_empty() { "any" } else { &c.pci }),
+                    None => match &current_lte {
+                        Some(c) => format!("Now on EARFCN {} · PCI {}", c.earfcn, c.pci),
+                        None => "No 4G cell".to_string(),
+                    },
+                };
+                let button = if lock.lte.is_some() {
+                    small_button(("cell-lte", 0), "Unlock", can_change)
+                        .when(can_change, |b| b.on_click(cx.listener(|_, _, _, cx| apply_lte_cell_lock(None, cx))))
+                } else {
+                    let cell = current_lte.clone();
+                    small_button(("cell-lte", 1), "Lock to current", can_change && cell.is_some())
+                        .when(can_change && cell.is_some(), |b| {
+                            b.on_click(cx.listener(move |_, _, _, cx| apply_lte_cell_lock(cell.clone(), cx)))
+                        })
+                };
+                list = list.child(cell_line(&t, "4G", lock.lte_state.label(), state_color(lock.lte_state), detail, button));
+
+                // 5G, when the network mode can use it
+                if nr_allowed {
+                    let detail = match lock.nr.as_ref().and_then(|c| c.first()) {
+                        Some(c) => format!("n{} · {} · PCI {}", c.band, c.arfcn, if c.pci.is_empty() { "any" } else { &c.pci }),
+                        None => match &current_nr {
+                            Some(c) => format!("Now on n{} · {} · PCI {}", c.band, c.arfcn, c.pci),
+                            None => "No 5G cell attached".to_string(),
+                        },
+                    };
+                    let button = if lock.nr.is_some() {
+                        small_button(("cell-nr", 0), "Unlock", can_change)
+                            .when(can_change, |b| b.on_click(cx.listener(|_, _, _, cx| apply_nr_cell_lock(None, cx))))
+                    } else {
+                        let cell = current_nr.clone();
+                        small_button(("cell-nr", 1), "Lock to current", can_change && cell.is_some())
+                            .when(can_change && cell.is_some(), |b| {
+                                b.on_click(cx.listener(move |_, _, _, cx| apply_nr_cell_lock(cell.clone(), cx)))
+                            })
+                    };
+                    list = list
+                        .child(cell_line(&t, "5G", lock.nr_state.label(), state_color(lock.nr_state), detail, button))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(t.on_surface_variant)
+                                .child("In NSA mode, lock the 4G and the 5G cell together."),
+                        );
+                }
+                list = list.child(
+                    div().flex().flex_row().child(
+                        t.text_button()
+                            .id("cell-edit")
+                            .h(px(28.))
+                            .px(px(8.))
+                            .text_xs()
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.remove_window();
+                                open_panel_at(Tab::Network, cx);
+                            }))
+                            .child("Edit cells in app"),
+                    ),
+                );
+                settings = settings.child(list);
+            }
         }
 
         // operator

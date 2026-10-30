@@ -35,8 +35,8 @@ use gpui::{
 };
 use gpui_tray::Tray;
 use x28_pro::{
-    fetch_once, operator_name, with_client, Client, Config, NetworkMode, OperatorSelection,
-    RouterSettings, Status,
+    fetch_once, operator_name, with_client, Client, Config, LteCell, NetworkMode, NrCell,
+    OperatorSelection, RouterSettings, Status,
 };
 
 use icon::Glyph;
@@ -305,6 +305,46 @@ fn apply_network_mode(mode: NetworkMode, cx: &mut App) {
         c.set_network_mode(mode.code())?;
         Ok(format!("Network mode set to {}. {REATTACH_NOTE}", mode.label()))
     });
+}
+
+/// Lock LTE to one cell, or unlock (`None`).
+fn apply_lte_cell_lock(cell: Option<LteCell>, cx: &mut App) {
+    let busy = match &cell {
+        Some(c) => format!("Locking 4G to EARFCN {}", c.earfcn),
+        None => "Unlocking the 4G cell".to_string(),
+    };
+    router_task(cx, busy, true, move |c| {
+        c.set_lte_cell_lock(cell.as_ref().map(std::slice::from_ref))?;
+        Ok(match &cell {
+            Some(cell) => format!("4G locked to EARFCN {} PCI {}. {REATTACH_NOTE}", cell.earfcn, or_any(&cell.pci)),
+            None => format!("4G cell unlocked. {REATTACH_NOTE}"),
+        })
+    });
+}
+
+/// Lock NR to one cell, or unlock (`None`).
+fn apply_nr_cell_lock(cell: Option<NrCell>, cx: &mut App) {
+    let busy = match &cell {
+        Some(c) => format!("Locking 5G to n{} ARFCN {}", c.band, c.arfcn),
+        None => "Unlocking the 5G cell".to_string(),
+    };
+    router_task(cx, busy, true, move |c| {
+        c.set_nr_cell_lock(cell.as_ref().map(std::slice::from_ref))?;
+        Ok(match &cell {
+            Some(cell) => format!(
+                "5G locked to n{} ARFCN {} PCI {}. {REATTACH_NOTE}",
+                cell.band,
+                cell.arfcn,
+                or_any(&cell.pci)
+            ),
+            None => format!("5G cell unlocked. {REATTACH_NOTE}"),
+        })
+    });
+}
+
+/// A blank PCI in a cell lock means "any PCI".
+fn or_any(pci: &str) -> &str {
+    if pci.is_empty() { "any" } else { pci }
 }
 
 fn apply_operator(selection: OperatorSelection, cx: &mut App) {

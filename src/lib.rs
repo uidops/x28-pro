@@ -105,6 +105,9 @@ const CMD_SYS_INFO: u32 = 0;
 // github.com/ehsanecc/modempatch (reboot); every write carries a fresh token.
 const CMD_REBOOT: u32 = 6;
 const CMD_BAND_LOCK: u32 = 161;
+// Cell lock fields as used by github.com/mattDev0/airtel-5g-monitor (ZLT):
+// subcmd 0 writes the LTE lock, subcmd 1 the NR lock.
+const CMD_CELL_LOCK: u32 = 160;
 const CMD_OPERATOR_SELECT: u32 = 228;
 const CMD_WRITE_TOKEN: u32 = 233;
 const CMD_NETWORK_MODE: u32 = 256;
@@ -427,6 +430,22 @@ impl Status {
                 Quality::Fair => 3,
                 Quality::Poor => 1,
             })
+        })
+    }
+
+    /// The serving LTE cell (primary carrier), for locking to it.
+    pub fn current_lte_cell(&self) -> Option<LteCell> {
+        let c = self.carriers().into_iter().find(|c| !c.nr)?;
+        Some(LteCell { earfcn: c.earfcn?, pci: c.pci.unwrap_or_default() })
+    }
+
+    /// The serving NR cell, for locking to it.
+    pub fn current_nr_cell(&self) -> Option<NrCell> {
+        let c = self.carriers().into_iter().find(|c| c.nr)?;
+        Some(NrCell {
+            band: c.band.trim_start_matches('n').to_string(),
+            arfcn: c.earfcn?,
+            pci: c.pci.unwrap_or_default(),
         })
     }
 
@@ -820,6 +839,9 @@ impl Client {
                 operator: c.at("AT+COPS?").ok().and_then(|r| parse_cops(&r)),
                 lte_supported: supported(&bands, "all_band_4g", &LTE_BANDS),
                 nr_supported: supported(&bands, "all_band_5g", &NR_BANDS),
+                // Some logins can't see the cell lock (LIMITED_ACCESS); the
+                // other settings still load.
+                cell_lock: c.get(CMD_CELL_LOCK).ok().and_then(|r| parse_cell_lock(&r)),
             })
         })
     }
@@ -862,6 +884,39 @@ impl Client {
                 .map(drop),
             OperatorSelection::Automatic => c.at("AT+COPS=0").map(drop),
         })
+    }
+
+    /// Lock LTE to these cells (`None` = unlock).
+    pub fn set_lte_cell_lock(&mut self, cells: Option<&[LteCell]>) -> Result<(), String> {
+        let cells = cells.filter(|c| !c.is_empty());
+        if let Some(c) = cells {
+            validate_lte_cells(c)?;
+        }
+        let join = |f: fn(&LteCell) -> &str| cells.map(|c| c.iter().map(f).collect::<Vec<_>>().join(",")).unwrap_or_default();
+        let fields = json!({
+            "subcmd": 0,
+            "lte_lock_sw": if cells.is_some() { "1" } else { "0" },
+            "lte_lock_freq": join(|c| &c.earfcn),
+            "lte_lock_pci": join(|c| &c.pci),
+        });
+        self.authed(|c| c.post(CMD_CELL_LOCK, fields.clone()).map(drop))
+    }
+
+    /// Lock NR to these cells (`None` = unlock).
+    pub fn set_nr_cell_lock(&mut self, cells: Option<&[NrCell]>) -> Result<(), String> {
+        let cells = cells.filter(|c| !c.is_empty());
+        if let Some(c) = cells {
+            validate_nr_cells(c)?;
+        }
+        let join = |f: fn(&NrCell) -> &str| cells.map(|c| c.iter().map(f).collect::<Vec<_>>().join(",")).unwrap_or_default();
+        let fields = json!({
+            "subcmd": 1,
+            "nr_lock_sw": if cells.is_some() { "1" } else { "0" },
+            "nr_lock_freq": join(|c| &c.arfcn),
+            "nr_lock_pci": join(|c| &c.pci),
+            "nr_lock_cell_band": join(|c| &c.band),
+        });
+        self.authed(|c| c.post(CMD_CELL_LOCK, fields.clone()).map(drop))
     }
 
     pub fn reboot(&mut self) -> Result<(), String> {
@@ -1087,6 +1142,124 @@ pub struct RouterSettings {
     /// Bands the radio supports, as the router reports them.
     pub lte_supported: Vec<u32>,
     pub nr_supported: Vec<u32>,
+    /// Physical cell lock; `None` if this login can't read it.
+    pub cell_lock: Option<CellLock>,
+}
+
+/// An LTE cell to lock to: EARFCN and PCI (PCI may be blank = any).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LteCell {
+    pub earfcn: String,
+    pub pci: String,
+}
+
+/// An NR cell to lock to: band number, NR-ARFCN and PCI (blank = any).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NrCell {
+    pub band: String,
+    pub arfcn: String,
+    pub pci: String,
+}
+
+/// Whether the modem holds a requested cell lock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LockState {
+    #[default]
+    Unlocked,
+    Locked,
+    /// Lock requested, but the modem couldn't camp on that cell.
+    Failed,
+}
+
+impl LockState {
+    pub fn label(self) -> &'static str {
+        match self {
+            LockState::Unlocked => "Unlocked",
+            LockState::Locked => "Locked",
+            LockState::Failed => "Lock failed",
+        }
+    }
+}
+
+/// Physical cell lock per radio; `None` cells = no lock requested.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellLock {
+    pub lte: Option<Vec<LteCell>>,
+    pub nr: Option<Vec<NrCell>>,
+    pub lte_state: LockState,
+    pub nr_state: LockState,
+}
+
+/// Read a cmd 160 reply; `None` if it has no lock fields at all.
+fn parse_cell_lock(reply: &Value) -> Option<CellLock> {
+    if reply.get("lte_lock_sw").is_none() && reply.get("nr_lock_sw").is_none() {
+        return None;
+    }
+    let list = |key: &str| -> Vec<String> {
+        text(reply, key)
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default()
+    };
+    let at = |v: &[String], i: usize| v.get(i).cloned().unwrap_or_default();
+    let state = |key: &str| match text(reply, key).as_deref() {
+        Some("1") => LockState::Locked,
+        Some("-1") => LockState::Failed,
+        _ => LockState::Unlocked,
+    };
+    let on = |key: &str| text(reply, key).as_deref() == Some("1");
+
+    let (freqs, pcis) = (list("lte_lock_freq"), list("lte_lock_pci"));
+    let lte: Vec<LteCell> = freqs
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.is_empty())
+        .map(|(i, f)| LteCell { earfcn: f.clone(), pci: at(&pcis, i) })
+        .collect();
+    let (freqs, pcis, bands) = (list("nr_lock_freq"), list("nr_lock_pci"), list("nr_lock_cell_band"));
+    let nr: Vec<NrCell> = freqs
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.is_empty())
+        .map(|(i, f)| NrCell { band: at(&bands, i), arfcn: f.clone(), pci: at(&pcis, i) })
+        .collect();
+    Some(CellLock {
+        lte: on("lte_lock_sw").then_some(lte),
+        nr: on("nr_lock_sw").then_some(nr),
+        lte_state: state("lock_4g_flag"),
+        nr_state: state("lock_5g_flag"),
+    })
+}
+
+fn in_range(v: &str, range: std::ops::RangeInclusive<u32>) -> bool {
+    v.parse::<u32>().is_ok_and(|n| range.contains(&n))
+}
+
+/// Ranges as the router's web UI accepts them.
+pub fn validate_lte_cells(cells: &[LteCell]) -> Result<(), String> {
+    for c in cells {
+        if !in_range(&c.earfcn, 0..=262_143) {
+            return Err("4G EARFCN must be a number from 0 to 262143".into());
+        }
+        if !c.pci.is_empty() && !in_range(&c.pci, 0..=503) {
+            return Err("4G PCI must be from 0 to 503, or blank".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_nr_cells(cells: &[NrCell]) -> Result<(), String> {
+    for c in cells {
+        if !in_range(&c.band, 1..=264) {
+            return Err("5G band must be a number from 1 to 264 (78 for n78)".into());
+        }
+        if !in_range(&c.arfcn, 1..=3_279_165) {
+            return Err("5G ARFCN must be a number from 1 to 3279165".into());
+        }
+        if !c.pci.is_empty() && !in_range(&c.pci, 0..=1007) {
+            return Err("5G PCI must be from 0 to 1007, or blank".into());
+        }
+    }
+    Ok(())
 }
 
 impl RouterSettings {
@@ -1496,6 +1669,43 @@ mod tests {
 
         let unset = json!({ "wanIP": "0.0.0.0", "dns1": "0.0.0.0" });
         assert!(wan_info(&unset).is_empty());
+    }
+
+    #[test]
+    fn cell_lock_parses_both_radios() {
+        let reply = json!({
+            "success": true,
+            "lte_lock_sw": "1", "lte_lock_freq": "1350,3150", "lte_lock_pci": "267,",
+            "lock_4g_flag": "1",
+            "nr_lock_sw": "0", "nr_lock_freq": "", "nr_lock_pci": "", "nr_lock_cell_band": "",
+            "lock_5g_flag": "-1",
+        });
+        let lock = parse_cell_lock(&reply).unwrap();
+        assert_eq!(
+            lock.lte,
+            Some(vec![
+                LteCell { earfcn: "1350".into(), pci: "267".into() },
+                LteCell { earfcn: "3150".into(), pci: "".into() },
+            ])
+        );
+        assert_eq!(lock.nr, None);
+        assert_eq!((lock.lte_state, lock.nr_state), (LockState::Locked, LockState::Failed));
+        assert!(parse_cell_lock(&json!({ "success": true })).is_none());
+    }
+
+    #[test]
+    fn cell_lock_values_are_range_checked() {
+        let lte = |e: &str, p: &str| LteCell { earfcn: e.into(), pci: p.into() };
+        assert!(validate_lte_cells(&[lte("1350", "267")]).is_ok());
+        assert!(validate_lte_cells(&[lte("1350", "")]).is_ok(), "blank PCI = any");
+        assert!(validate_lte_cells(&[lte("300000", "1")]).is_err());
+        assert!(validate_lte_cells(&[lte("1350", "504")]).is_err());
+        assert!(validate_lte_cells(&[lte("", "1")]).is_err());
+
+        let nr = |b: &str, a: &str, p: &str| NrCell { band: b.into(), arfcn: a.into(), pci: p.into() };
+        assert!(validate_nr_cells(&[nr("78", "650000", "319")]).is_ok());
+        assert!(validate_nr_cells(&[nr("0", "650000", "")]).is_err());
+        assert!(validate_nr_cells(&[nr("78", "650000", "1008")]).is_err());
     }
 
     #[test]

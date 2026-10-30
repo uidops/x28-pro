@@ -12,15 +12,32 @@ use gpui::{
     Subscription, Window,
 };
 use x28_pro::{
-    operator_name, BandLock, Client, Config, Heat, NetworkMode, OperatorSelection, Quality,
-    RouterSettings, mode_allows_nr, signal_label, OPERATORS,
+    operator_name, validate_lte_cells, validate_nr_cells, BandLock, CellLock, Client, Config, Heat,
+    LockState, LteCell, NetworkMode, NrCell, OperatorSelection, Quality, RouterSettings,
+    mode_allows_nr, signal_label, OPERATORS,
 };
 
 use crate::theme::Theme;
-use crate::{read_router_settings, router_task, AppState, REATTACH_NOTE};
+use crate::{apply_lte_cell_lock, apply_nr_cell_lock, read_router_settings, router_task, AppState, REATTACH_NOTE};
 
-/// Element ids for the three settings fields (ElementId needs static strs).
-const FIELD_IDS: [&str; 3] = ["field-router", "field-user", "field-pass"];
+/// Element ids for the text fields (ElementId needs static strs): the App
+/// tab's connection settings, then the Network tab's cell lock values.
+const FIELD_IDS: [&str; 8] = [
+    "field-router",
+    "field-user",
+    "field-pass",
+    "field-lte-earfcn",
+    "field-lte-pci",
+    "field-nr-band",
+    "field-nr-arfcn",
+    "field-nr-pci",
+];
+/// Indexes into `Panel::fields`.
+const LTE_EARFCN: usize = 3;
+const LTE_PCI: usize = 4;
+const NR_BAND: usize = 5;
+const NR_ARFCN: usize = 6;
+const NR_PCI: usize = 7;
 
 /// `(value - min) / (max - min)`, for placing a reading on a meter.
 fn fraction(value: Option<f32>, min: f32, max: f32) -> Option<f32> {
@@ -109,6 +126,8 @@ struct Field {
     cursor: usize,
     focus: FocusHandle,
     masked: bool,
+    /// Accepts digits only.
+    numeric: bool,
 }
 
 impl Field {
@@ -120,7 +139,18 @@ impl Field {
             chars,
             focus: cx.focus_handle(),
             masked,
+            numeric: false,
         }
+    }
+
+    fn numeric(mut self) -> Self {
+        self.numeric = true;
+        self
+    }
+
+    fn set(&mut self, value: &str) {
+        self.chars = value.chars().collect();
+        self.cursor = self.chars.len();
     }
 
     fn value(&self) -> String {
@@ -169,7 +199,8 @@ impl Field {
             _ => {
                 if !command {
                     if let Some(ch) = stroke.key_char.as_deref() {
-                        if !ch.chars().any(char::is_control) {
+                        let allowed = |c: char| !c.is_control() && (!self.numeric || c.is_ascii_digit());
+                        if ch.chars().all(allowed) {
                             let insertion: Vec<char> = ch.chars().collect();
                             let added = insertion.len();
                             let at = self.cursor;
@@ -196,6 +227,11 @@ pub(crate) struct Panel {
     confirm_reboot: bool,
     capturing: bool,
     capture_note: Option<Result<String, String>>,
+    /// Cell lock radio choice per radio; `None` = what the router has.
+    lte_cell_lock: Option<bool>,
+    nr_cell_lock: Option<bool>,
+    /// The cell lock fields were filled from the router's lock once.
+    cell_fields_loaded: bool,
     /// Re-renders with the matching scheme when the system goes light/dark.
     _appearance: Subscription,
 }
@@ -209,6 +245,11 @@ impl Panel {
                 Field::new("Router", &config.host, false, cx),
                 Field::new("User", &config.user, false, cx),
                 Field::new("Password", &config.pass, true, cx),
+                Field::new("EARFCN", "", false, cx).numeric(),
+                Field::new("PCI", "", false, cx).numeric(),
+                Field::new("Band", "", false, cx).numeric(),
+                Field::new("ARFCN", "", false, cx).numeric(),
+                Field::new("PCI", "", false, cx).numeric(),
             ],
             poll_secs: config.poll_secs,
             menu_title: config.menu_title,
@@ -217,6 +258,9 @@ impl Panel {
             confirm_reboot: false,
             capturing: false,
             capture_note: None,
+            lte_cell_lock: None,
+            nr_cell_lock: None,
+            cell_fields_loaded: false,
             _appearance: cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
         }
     }
@@ -294,30 +338,99 @@ impl Panel {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tab != Tab::App {
-            return;
-        }
+        // Each tab cycles through its own fields.
+        let group = match self.tab {
+            Tab::App => 0..LTE_EARFCN,
+            Tab::Network => LTE_EARFCN..FIELD_IDS.len(),
+            Tab::Status | Tab::Device => return,
+        };
         let key = event.keystroke.key.as_str();
         if key == "tab" {
-            let len = self.fields.len();
-            let current = self
-                .fields
-                .iter()
-                .position(|f| f.focus.is_focused(window))
+            let len = group.len();
+            let current = group
+                .clone()
+                .position(|i| self.fields[i].focus.is_focused(window))
                 .unwrap_or(0);
             let next = if event.keystroke.modifiers.shift {
                 current.checked_sub(1).unwrap_or(len - 1)
             } else {
                 (current + 1) % len
             };
-            let handle = self.fields[next].focus.clone();
+            let handle = self.fields[group.start + next].focus.clone();
             window.focus(&handle);
             cx.notify();
             return;
         }
-        if let Some(index) = self.fields.iter().position(|f| f.focus.is_focused(window)) {
+        if let Some(index) = group.clone().find(|&i| self.fields[i].focus.is_focused(window)) {
             self.fields[index].handle_key(event, window, cx);
         }
+    }
+
+    /// Fill the cell lock fields from the router's lock the first time it is
+    /// known, so a locked cell shows its values.
+    fn sync_cell_fields(&mut self, cx: &mut Context<Self>) {
+        if self.cell_fields_loaded {
+            return;
+        }
+        let Some(lock) = cx.global::<AppState>().router.as_ref().and_then(|r| r.cell_lock.clone()) else {
+            return;
+        };
+        if let Some(c) = lock.lte.as_ref().and_then(|c| c.first()) {
+            self.fields[LTE_EARFCN].set(&c.earfcn);
+            self.fields[LTE_PCI].set(&c.pci);
+        }
+        if let Some(c) = lock.nr.as_ref().and_then(|c| c.first()) {
+            self.fields[NR_BAND].set(&c.band);
+            self.fields[NR_ARFCN].set(&c.arfcn);
+            self.fields[NR_PCI].set(&c.pci);
+        }
+        self.cell_fields_loaded = true;
+    }
+
+    fn lte_cell(&self) -> LteCell {
+        LteCell { earfcn: self.fields[LTE_EARFCN].value(), pci: self.fields[LTE_PCI].value() }
+    }
+
+    fn nr_cell(&self) -> NrCell {
+        NrCell {
+            band: self.fields[NR_BAND].value(),
+            arfcn: self.fields[NR_ARFCN].value(),
+            pci: self.fields[NR_PCI].value(),
+        }
+    }
+
+    /// Copy the serving cell into the fields.
+    fn use_current_cell(&mut self, nr: bool, cx: &mut Context<Self>) {
+        let status = cx.global::<AppState>().status.clone();
+        if nr {
+            if let Some(c) = status.and_then(|s| s.current_nr_cell()) {
+                self.fields[NR_BAND].set(&c.band);
+                self.fields[NR_ARFCN].set(&c.arfcn);
+                self.fields[NR_PCI].set(&c.pci);
+                self.nr_cell_lock = Some(true);
+            }
+        } else if let Some(c) = status.and_then(|s| s.current_lte_cell()) {
+            self.fields[LTE_EARFCN].set(&c.earfcn);
+            self.fields[LTE_PCI].set(&c.pci);
+            self.lte_cell_lock = Some(true);
+        }
+        cx.notify();
+    }
+
+    fn apply_cell_lock(&mut self, nr: bool, cx: &mut Context<Self>) {
+        let lock = cx.global::<AppState>().router.as_ref().and_then(|r| r.cell_lock.clone()).unwrap_or_default();
+        if nr {
+            let on = self.nr_cell_lock.unwrap_or(lock.nr.is_some());
+            apply_nr_cell_lock(on.then(|| self.nr_cell()), cx);
+            self.nr_cell_lock = None;
+        } else {
+            let on = self.lte_cell_lock.unwrap_or(lock.lte.is_some());
+            apply_lte_cell_lock(on.then(|| self.lte_cell()), cx);
+            self.lte_cell_lock = None;
+        }
+        // Show the router's lock values once it has been re-read.
+        self.cell_fields_loaded = false;
+        cx.notify();
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -744,7 +857,7 @@ impl Panel {
         col
     }
 
-    fn network_tab(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
+    fn network_tab(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
         let state = cx.global::<AppState>();
         let busy = state.router_busy.is_some();
         let Some(router) = state.router.clone() else {
@@ -855,10 +968,128 @@ impl Panel {
             );
         }
         content = content.child(bar);
-        content.child(supporting(
+        content = content.child(supporting(
             t,
             problem.unwrap_or("Changes go to the router only when you apply them. Mode, band and operator changes make the modem re-attach, which drops the connection for up to a minute."),
-        ))
+        ));
+
+        // ---- physical cell lock (applied per radio, like the web UI) ---------------
+        match &router.cell_lock {
+            Some(lock) => {
+                let nr = router.allows_nr();
+                content = content.child(section(t, "4G LOCKED CELL")).child(self.cell_card(t, window, cx, false, lock, busy));
+                if nr {
+                    content = content
+                        .child(section(t, "5G LOCKED CELL"))
+                        .child(self.cell_card(t, window, cx, true, lock, busy))
+                        .child(banner(
+                            t.surface_container_high,
+                            t.on_surface,
+                            "!",
+                            "In NSA mode, lock the 4G and the 5G cell at the same time.".to_string(),
+                        ));
+                }
+                content
+            }
+            None => content
+                .child(section(t, "CELL LOCK"))
+                .child(t.card().child(supporting(t, "The router doesn't show the cell lock to this login."))),
+        }
+    }
+
+    /// One radio's physical cell lock: status, unlock / lock choice, the cell
+    /// values (with "Use current cell") and its own Apply.
+    fn cell_card(&self, t: &Theme, window: &Window, cx: &mut Context<Self>, nr: bool, lock: &CellLock, busy: bool) -> Div {
+        let (state, router_on, choice) = if nr {
+            (lock.nr_state, lock.nr.is_some(), self.nr_cell_lock)
+        } else {
+            (lock.lte_state, lock.lte.is_some(), self.lte_cell_lock)
+        };
+        let on = choice.unwrap_or(router_on);
+        let key = if nr { "nr" } else { "lte" };
+
+        let state_color = match state {
+            LockState::Locked => t.good,
+            LockState::Failed => t.bad,
+            LockState::Unlocked => t.on_surface_variant,
+        };
+        let status = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(div().text_sm().child("Locked status"))
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(state_color).child(state.label()));
+
+        let radio = |id: &'static str, selected: bool, label: &str, lock_on: bool| {
+            t.radio_row(selected, label, None).id(id).on_click(cx.listener(move |this, _, _, cx| {
+                if nr {
+                    this.nr_cell_lock = Some(lock_on);
+                } else {
+                    this.lte_cell_lock = Some(lock_on);
+                }
+                cx.notify();
+            }))
+        };
+        let (unlock_id, lock_id) = if nr { ("nr-unlock", "nr-lock-cell") } else { ("lte-unlock", "lte-lock-cell") };
+        let mut card = t
+            .card()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(status)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(radio(unlock_id, !on, "Unlock", false))
+                    .child(radio(lock_id, on, "Lock specific physical cell", true)),
+            );
+
+        let problem = if on {
+            let fields: Vec<usize> = if nr { vec![NR_BAND, NR_ARFCN, NR_PCI] } else { vec![LTE_EARFCN, LTE_PCI] };
+            let mut row = div().flex().flex_row().gap(px(8.));
+            for i in fields {
+                row = row.child(self.field_cell(t, i, window, cx).flex_1());
+            }
+            let current = cx.global::<AppState>().status.as_ref().is_some_and(|s| {
+                if nr { s.current_nr_cell().is_some() } else { s.current_lte_cell().is_some() }
+            });
+            let use_current = t
+                .text_button()
+                .id((key, 1usize))
+                .child(if nr { "Use current 5G cell" } else { "Use current 4G cell" });
+            let use_current = if current {
+                use_current.on_click(cx.listener(move |this, _, _, cx| this.use_current_cell(nr, cx)))
+            } else {
+                t.disabled(use_current)
+            };
+            card = card.child(row).child(div().flex().flex_row().child(use_current));
+            if nr { validate_nr_cells(&[self.nr_cell()]).err() } else { validate_lte_cells(&[self.lte_cell()]).err() }
+        } else {
+            None
+        };
+
+        let apply = t
+            .filled()
+            .id((key, 2usize))
+            .h(px(36.))
+            .px(px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_sm()
+            .child("Apply");
+        let apply = if !busy && problem.is_none() {
+            apply.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.apply_cell_lock(nr, cx)))
+        } else {
+            t.disabled(apply)
+        };
+        let mut footer = div().flex().flex_row().items_center().gap(px(12.)).child(apply);
+        if let Some(p) = problem {
+            footer = footer.child(div().flex_1().text_xs().text_color(t.bad).child(p));
+        }
+        card.child(footer)
     }
 
     /// Lock switch plus a filter chip per band.
@@ -1219,7 +1450,10 @@ impl Render for Panel {
 
         let body = match self.tab {
             Tab::Status => self.status_tab(&t, cx),
-            Tab::Network => self.network_tab(&t, cx),
+            Tab::Network => {
+                self.sync_cell_fields(cx);
+                self.network_tab(&t, window, cx)
+            }
             Tab::Device => self.device_tab(&t, cx),
             Tab::App => self.app_tab(&t, window, cx),
         };
