@@ -148,7 +148,6 @@ impl Render for Popover {
         let router = state.router.clone();
         let busy = state.router_busy.clone();
         let note = state.router_note.clone();
-        let poll = state.config.poll_secs;
         let paused = state.paused;
         let age = state.updated.map(|u| u.elapsed().as_secs());
 
@@ -350,7 +349,7 @@ impl Render for Popover {
                                 (Some(s), true) if s < 60 => format!("Paused · updated {s}s ago"),
                                 (Some(s), true) => format!("Paused · updated {}m ago", s / 60),
                                 (None, true) => "Paused".to_string(),
-                                (Some(s), false) if s < 60 => format!("updated {s}s ago · every {poll}s"),
+                                (Some(s), false) if s < 60 => format!("updated {s}s ago"),
                                 (Some(s), false) => format!("updated {}m ago", s / 60),
                                 (None, false) => "not updated yet".to_string(),
                             })),
